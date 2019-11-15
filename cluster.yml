@@ -1,0 +1,106 @@
+---
+- hosts: mq-cluster
+  become: yes
+  become_user: root
+
+  vars:
+    rabbitmq_hosts: |
+      10.1.4.18 rabbit1 
+      10.1.4.36 rabbit2
+      10.1.4.58 rabbit3
+    rabbitmq_cluster_master: rabbit1
+    rabbitmq_erlang_cookie: WKRBTTEQRYPTQOFAAAAAAJ
+    # erlang
+    erlang_series: 20
+    erlang_deb_repo_url: https://dl.bintray.com/rabbitmq-erlang/debian
+    erlang_deb_gpg_url: https://dl.bintray.com/rabbitmq/Keys/rabbitmq-release-signing-key.asc
+    erlang_deb_repo_tpl: etc/apt/sources.list.d/rabbitmq_erlang.list.j2
+    erlang_deb_pinning_tpl: etc/apt/preferences.d/erlang.j2
+    erlang_series_deb_version:
+
+  tasks:
+  - blockinfile:
+      path: /etc/hosts
+      block: "{{ rabbitmq_hosts }}"
+      owner: root
+      group: root
+      mode: 0644
+
+  - include_tasks: erlang_debian.yml
+
+  - name: install stuff
+    apt:
+      update_cache: yes
+      force: yes
+      pkg: ['rabbitmq-server', 'python-pip']
+      state: present
+
+  - name: Install pika
+    pip:
+      name: pika
+
+  - name: rabbitmq service started and enabled
+    service:
+      name: rabbitmq-server
+      enabled: yes
+      state: started
+
+  # rc 70: user already exists
+  - name: create test user
+    shell: rabbitmqctl add_user test test
+    register: res
+    failed_when: res.rc != 70 and res.rc != 0
+    changed_when: res.rc != 70
+
+  - name: list permissions for test user
+    shell: rabbitmqctl list_permissions
+    register: list_permissions
+    changed_when: false
+
+  - name: set permissions on / vhost
+    shell: rabbitmqctl set_permissions test ".*" ".*" ".*"
+    when: list_permissions.stdout.find("test") == -1
+
+  - name: make sure rabbitmq server is up
+    service:
+      name: rabbitmq-server
+      state: started
+
+  - name: make sure rabbitmq app is up
+    command: rabbitmqctl start_app
+
+  - name: updating rabbitmq erlang cookie
+    template:
+      src: erlang.cookie.j2
+      dest: /var/lib/rabbitmq/.erlang.cookie
+      owner: rabbitmq
+      group: rabbitmq
+      mode: 0400
+    notify:
+      stop rabbitmq-server
+
+  - meta: flush_handlers
+
+  - name: remove old erlang cookie
+    file:
+      path: /var/lib/rabbitmq/.erlang.cookie.old
+      state: absent
+    changed_when: false
+
+  - name: check if already in cluster
+    command: rabbitmqctl cluster_status
+    register: cluster_status
+    changed_when: false
+
+  - include_tasks: join_cluster.yml
+    when: cluster_status.stdout.find("rabbit@{{ rabbitmq_cluster_master }}") == -1 and (ansible_fqdn != rabbitmq_cluster_master)
+
+  handlers:
+    - name: restart rabbitmq-server
+      service: name=rabbitmq-server state=restarted
+
+    - name: start rabbitmq-server
+      service: name=rabbitmq-server state=started
+
+    - name: stop rabbitmq-server
+      service: name=rabbitmq-server state=stopped
